@@ -83,17 +83,11 @@ private:
     ID = 2 ->to control motor2
     Value = 60 ->motor speed value
     */
-/*
     json sample_msg = {
         {"Type", 0},
         {"Subsystem", 1},
         {"ID", 2},
         {"Value", 60}
-    };
-*/
-    json sample_msg = {
-        {"Ty", 0},
-        {"ID", 2}
     };
 
 public:
@@ -121,7 +115,6 @@ int main()
     Data_Transfer dataTrans;
 
     dataTrans.data_str += '\0';//to add NULL character at the end of JSON string
-    //std::cout << dataTrans.data_str << std::endl;
     crc16_checkvalue = crc.crc16_ccitt(dataTrans.data_str, dataTrans.data_str.length());
     crc16_Tx_bytes[0] = ((crc16_checkvalue) & (0xFF));//lower byte
     crc16_Tx_bytes[1] = ((crc16_checkvalue >> 8) & (0xFF));//higher byte
