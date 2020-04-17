@@ -27,7 +27,7 @@ enum
 };
 
 //Buffer Size
-#define BUFFER_SIZE 32
+#define BUFFER_SIZE 50
 //JSON String Size
 #define JSON_STRING_SIZE 150
 //jsmn_tok array size
@@ -139,7 +139,7 @@ int main(void)
     //Enable interrupts to the processor
     IntMasterEnable();
 
-    //while(1)
+    while(1)
     {
         if(receiving_status == true)
         {
@@ -170,8 +170,6 @@ int main(void)
                 uint16_t Tx_crc16 = crc16_ccitt(final_json_str, strlen(final_json_str) + 1);
                 Tx_crc16_bytes[0] = (Tx_crc16 & 0xFF);
                 Tx_crc16_bytes[1] = ((Tx_crc16 >> 8) & 0xFF);
-
-                UART0_DR_R = 'k';//dummy byte
             }
         }
         else if(receiving_status == false)
@@ -266,17 +264,13 @@ void UART_config(void)
     UART0_FBRD_R = 43;
 
     //Write the desired serial parameters in UARTLCRH register (UART Line Control)
-    UART0_LCRH_R = (0x03 << 5) | (1 << 4); //8bit data, no parity, 1 stop bit, FIFO buffer enabled
+    UART0_LCRH_R = (0x03 << 5); //8bit data, no parity, 1 stop bit, FIFO buffer disabled
 
     //Set clock configuration for UART. Default System Clock is PIOSC which has 16MHz frequency. System Clock used here for UART clock source.
     UART0_CC_R = 0x05;
 
-    //FIFO interrupt level select
-    UART0_IFLS_R &= ~(0x38);//Rx FLS >= 1/8th full
-    UART0_IFLS_R &= ~(0x07);//Tx FLS <= 7/8th empty
-
-    //Receive interrupt and Receive Timeout interrupt(32 bit period) enabled. Will enable transmit interrupt when required
-    UART0_IM_R |= (1 << 4)|(1 << 5)|(1 << 6);
+    //Receive interrupt and Transmit interrupt enabled
+    UART0_IM_R |= (1 << 4)|(1 << 5);
 
     // Set the priority to 1
     IntPrioritySet(INT_UART0, 0);
@@ -293,30 +287,31 @@ void UART_config(void)
 
 void UART0_Handler(void)
 {
-    //Receive Interrupt or Receive Timeout Interrupt
-    if( (((UART0_MIS_R) & (1 << 4)) == (1 << 4)) || (((UART0_MIS_R) & (1 << 5)) == (1 << 5)) )
+    //Receive Interrupt
+    if( (((UART0_MIS_R) & (1 << 4)) == (1 << 4)) )
     {
-        while( (((UART0_FR_R) & (1 << 4)) == 0) && (buffer_space(&buffRx) != BUFF_FULL) )//while(Rx_FIFO != EMPTY && Rx_circular_buffer != FULL)
+        if( (((UART0_FR_R) & (1 << 4)) == 0) && (buffer_space(&buffRx) != BUFF_FULL) )//if(Rx_FIFO != EMPTY && Rx_circular_buffer != FULL)
         {
             uint8_t data = UART0_DR_R;
             buffer_add(&buffRx, data);
         }
 
         UART0_ICR_R |= (1 << 4);//clearing Receive Interrupt flag
-        UART0_ICR_R |= (1 << 6);//clearing Receive Timeout Interrupt flag
         return;
     }
     else if( ((UART0_MIS_R) & (1 << 5)) == (1 << 5) )//Transmit Interrupt
     {
         if(buffer_space(&buffTx) == BUFF_EMPTY)//no data present in the circular buffer to add to the Tx FIFO
         {
+            //disabling transmit interrupt
+            UART0_IM_R &= ~(1 << 5);
             //clearing Transmit Interrupt Flag
             UART0_ICR_R |= (1 << 5);
             return;
         }
         else
         {
-            while((((UART0_FR_R) & (1 << 5)) != (1 << 5)) && (buffer_space(&buffTx) != BUFF_EMPTY))//while(Tx_FIFO != FULL && Tx_circular_buffer != EMPTY)
+            if( (((UART0_FR_R) & (1 << 5)) != (1 << 5)) )//if(Tx_FIFO != FULL)
             {
                 uint8_t data = buffer_get(&buffTx);//add data to Tx FIFO
                 UART0_DR_R = data;
@@ -388,7 +383,7 @@ void parse_message(void)
                         new_message_received = true;
                         msg_parse_state = GET_JSON;//Ready for new message
                     }
-
+                    break;
                 }
             }
             break;
@@ -461,7 +456,7 @@ void send_message(void)
                         //Ready for new message to send
                         msg_send_state = SEND_JSON;
                     }
-
+                    break;
                 }
             }
             break;
@@ -496,15 +491,20 @@ void send_data(uint8_t outgoing_data)
         if(((UART0_FR_R) & (1 << 5)) != (1 << 5))//if(Tx_FIFO != FULL)
         {
             UART0_DR_R = outgoing_data;
+            UART0_IM_R |= (1 << 5);//enable Tx interrupt
         }
         else
         {
+            UART0_IM_R &= ~(1 << 5);//disable Tx interrupt
             buffer_add(&buffTx, outgoing_data);
+            UART0_IM_R |= (1 << 5);//enable Tx interrupt
         }
     }
     else
     {
+        UART0_IM_R &= ~(1 << 5);//disable Tx interrupt
         buffer_add(&buffTx, outgoing_data);
+        UART0_IM_R |= (1 << 5);//enable Tx interrupt
     }
 }
 
