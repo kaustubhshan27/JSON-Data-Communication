@@ -1,6 +1,8 @@
-#include "stdbool.h"
-#include "string.h"
-#include "stdint.h"
+#include <stdbool.h>
+#include <string.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <ctype.h>
 #include "inc/tm4c123gh6pm.h"
 #include "driverlib/interrupt.h"
 #include "jsmn.h"
@@ -8,22 +10,30 @@
 
 enum
 {
-    GET_JSON = 1,
-    GET_CRC  = 2,
-    SEND_JSON = 3,
-    SEND_CRC = 4
+    GET_JSON = 11,
+    GET_CRC  = 12,
+    SEND_JSON = 13,
+    SEND_CRC = 14
 };
 
 enum
 {
-    JSON_HEADER = 11,
-    JSON_ENDING = 12,
+    JSON_HEADER = 21,
+    JSON_ENDING = 22,
 };
 
 enum
 {
-    CRC_1 = 21,
-    CRC_2 = 22
+    CRC_1 = 31,
+    CRC_2 = 32
+};
+
+enum token
+{
+    SUBSYSTEM_TOKEN = 1,
+    MSG_TYPE_TOKEN = 2,
+    ID_TOKEN = 3,
+    VALUE_TOKEN = 4
 };
 
 //Buffer Size
@@ -71,6 +81,14 @@ bool new_message_received = false;
 bool new_message_sent = false;
 //sending or receiving status
 bool receiving_status = true;
+//to count the number of keys in the JSON message
+uint8_t num_of_keys = 0;
+
+//information(values) to be received from JSON
+uint8_t subsystem;
+uint8_t msg_type;
+uint8_t id;
+uint16_t value;
 
 static const uint16_t table[256] =
 {
@@ -118,9 +136,16 @@ void UART_init(void);
 void UART_config(void);
 void UART0_Handler(void);
 
+void adc_config(void);
+
+void systick_config(void);
+
 void parse_message(void);
-bool validate_message(void);
 void record_data(uint8_t incoming_data);
+bool validate_message(void);
+bool extract_json(void);
+int search_key(const char *key_string);
+bool get_key_value(uint8_t key_index, enum token token_type);
 void send_message(void);
 void send_data(uint8_t outgoing_data);
 
@@ -143,13 +168,13 @@ int main(void)
     {
         if(receiving_status == true)
         {
+            //--do receiving
             parse_message();
             if(new_message_received == true)
             {
                 if(validate_message() == true)
                 {
                     /*validation successful*/
-                    //Copy received string to final JSON string -> memcpy()
                     memcpy(final_json_str, received_json_str, length_of_json);
 
                     //Parsing JSON string
@@ -157,11 +182,15 @@ int main(void)
                     jsmn_init(&parser);
                     jsmn_parse(&parser, final_json_str, strlen(final_json_str), tokens, TOKEN_ARRAY_SIZE);
 
+                    //Data extraction from JSON string
+                    if(extract_json() == true)
+                    {
+                        //extraction and validation is successful. All information from JSON extracted
+                    }
                 }
                 else
                 {
                     /*validation failed*/
-
                 }
                 new_message_received = false;
                 receiving_status = false;//FOR NOW --- TO BE CHANGED LATER
@@ -287,8 +316,7 @@ void UART_config(void)
 
 void UART0_Handler(void)
 {
-    //Receive Interrupt
-    if( (((UART0_MIS_R) & (1 << 4)) == (1 << 4)) )
+    if( (((UART0_MIS_R) & (1 << 4)) == (1 << 4)) )//Receive Interrupt
     {
         if( (((UART0_FR_R) & (1 << 4)) == 0) && (buffer_space(&buffRx) != BUFF_FULL) )//if(Rx_FIFO != EMPTY && Rx_circular_buffer != FULL)
         {
@@ -303,10 +331,8 @@ void UART0_Handler(void)
     {
         if(buffer_space(&buffTx) == BUFF_EMPTY)//no data present in the circular buffer to add to the Tx FIFO
         {
-            //disabling transmit interrupt
-            UART0_IM_R &= ~(1 << 5);
-            //clearing Transmit Interrupt Flag
-            UART0_ICR_R |= (1 << 5);
+            UART0_IM_R &= ~(1 << 5);//disabling transmit interrupt
+            UART0_ICR_R |= (1 << 5);//clearing Transmit Interrupt Flag
             return;
         }
         else
@@ -316,11 +342,48 @@ void UART0_Handler(void)
                 uint8_t data = buffer_get(&buffTx);//add data to Tx FIFO
                 UART0_DR_R = data;
             }
-            //clearing Transmit Interrupt Flag
-            UART0_ICR_R |= (1 << 5);
+            UART0_ICR_R |= (1 << 5);//clearing Transmit Interrupt Flag
             return;
         }
     }
+}
+
+void adc_config(void)
+{
+    //Enable the ADC clock using the RCGCADC register. Enabling ADC1
+    SYSCTL_RCGCADC_R |= (1 << 1);
+
+    //Enable GPIO for port B
+    SYSCTL_RCGCGPIO_R |= (1 << 1);
+    //PB5 as input
+    GPIO_PORTB_DIR_R &= ~(1 << 5);
+    //AIN11-PB5 configuration
+    GPIO_PORTB_AFSEL_R |= (1 << 5);
+    GPIO_PORTB_DEN_R &= ~(1 << 5);
+    GPIO_PORTB_AMSEL_R |= (1 << 5);
+
+    //Using SS3, disabling for configuration
+    ADC1_ACTSS_R &= ~(1 << 3);
+
+    //Processor(default) trigger. The trigger is initiated by setting the SS3 bit in the ADCPSSI register
+    ADC1_EMUX_R |= (0x0 << 12);
+
+    //AIN11-PB5. Configuring the input source for the sample sequencer 3
+    ADC1_SSMUX3_R = 11;
+
+    //End of Sequence. This bit must be set before initiating a single sample sequence.
+    ADC1_SSCTL3_R |= (1 << 1);
+
+    //Enabling SS3
+    ADC1_ACTSS_R |= (1 << 3);
+}
+
+void systick_config(void)
+{
+    NVIC_ST_CTRL_R = 0x04;//enable = 0, clk_src = 1 (System Clock=>PIOSC=16MHz)
+    NVIC_ST_RELOAD_R = 533334 - 1;//30Hz(=0.033secs) frequency for systick thread
+    NVIC_ST_CURRENT_R = 0x00; //to clear by writing to the current value register
+    NVIC_ST_CTRL_R |= (1 << 0); //enable and start timer
 }
 
 void parse_message(void)
@@ -358,6 +421,8 @@ void parse_message(void)
                         }
                         else
                         {
+                            if(incoming_data == ':')
+                                num_of_keys++;
                             record_data(incoming_data);
                         }
                     }
@@ -379,7 +444,6 @@ void parse_message(void)
                     {
                         Rx_crc16_bytes[1] = buffer_get(&buffRx);
                         crc_state = CRC_1;
-
                         new_message_received = true;
                         msg_parse_state = GET_JSON;//Ready for new message
                     }
@@ -453,8 +517,7 @@ void send_message(void)
                         send_data(Tx_crc16_bytes[1]);
                         crc_state = CRC_1;
                         new_message_sent = true;
-                        //Ready for new message to send
-                        msg_send_state = SEND_JSON;
+                        msg_send_state = SEND_JSON;//Ready for new message to send
                     }
                     break;
                 }
@@ -476,6 +539,104 @@ bool validate_message(void)
     {
         return false;
     }
+}
+
+bool get_key_value(uint8_t value_index, enum token token_type)
+{
+    int token_length = tokens[value_index].end - tokens[value_index].start;
+    char val[10];
+    strncpy(val, &final_json_str[tokens[value_index].start], token_length);
+    val[token_length] = '\0';
+    if(!isdigit(val[0]))
+        return false;
+    else
+    {
+        switch(token_type)
+        {
+            case SUBSYSTEM_TOKEN:
+            {
+                subsystem = atoi(val);
+            }
+            break;
+            case MSG_TYPE_TOKEN:
+            {
+                msg_type = atoi(val);
+            }
+            break;
+            case ID_TOKEN:
+            {
+                id = atoi(val);
+            }
+            break;
+            case VALUE_TOKEN:
+            {
+                value = atoi(val);
+            }
+            break;
+        }
+        return true;
+    }
+}
+
+int search_key(const char *key_string)
+{
+    int token_length;
+    bool search_flag = false;
+    uint8_t token_index = 1;
+    uint8_t key_count = 0;
+    char key[20];
+
+    while(key_count < num_of_keys)
+    {
+        token_length = tokens[token_index].end - tokens[token_index].start;
+        strncpy(key, &final_json_str[tokens[token_index].start], token_length);
+        key[token_length] = '\0';
+
+        if(strcmp(key, key_string) == 0)//key is found
+        {
+            search_flag = true;
+            break;
+        }
+
+        key_count++;
+        token_index += 2;
+    }
+
+    if(search_flag == false)
+        return -1;
+    else
+        return token_index;
+}
+
+bool extract_json(void)
+{
+    int token_index;
+
+    if((token_index = search_key("subsystem")) != -1)
+    {
+        if(get_key_value(token_index + 1, SUBSYSTEM_TOKEN) == false)
+                return false;
+    }
+
+    if((token_index = search_key("msg_type")) != -1)
+    {
+        if(get_key_value(token_index + 1, MSG_TYPE_TOKEN) == false)
+                return false;
+    }
+
+    if((token_index = search_key("id")) != -1)
+    {
+        if(get_key_value(token_index + 1, ID_TOKEN) == false)
+                return false;
+    }
+
+    if((token_index = search_key("value")) != -1)
+    {
+        if(get_key_value(token_index + 1, VALUE_TOKEN) == false)
+                return false;
+    }
+
+    return true;//if everything goes well
 }
 
 void record_data(uint8_t incoming_data)
@@ -522,4 +683,3 @@ uint16_t crc16_ccitt(const char *data, uint8_t len)
 
     return crc;
 }
-
