@@ -1,10 +1,15 @@
+#include <stdio.h>
 #include <stdbool.h>
 #include <string.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <ctype.h>
 #include "inc/tm4c123gh6pm.h"
+#include "inc/hw_memmap.h"
+#include "inc/hw_adc.h"
 #include "driverlib/interrupt.h"
+#include "driverlib/udma.h"
+#include "driverlib/adc.h"
 #include "jsmn.h"
 
 
@@ -36,6 +41,8 @@ enum token
     VALUE_TOKEN = 4
 };
 
+//Clock Frequency PIOSC (16MHz)
+#define PIOSC_FREQ 16000000
 //Buffer Size
 #define BUFFER_SIZE 50
 //JSON String Size
@@ -48,6 +55,10 @@ enum token
 #define BUFF_FULL 1
 //Circular buffer NOT FULL condition
 #define BUFF_NOT_FULL 2
+//Max size of char array used to store keys from JSON messages
+#define MAX_KEY_SIZE 20
+//Max size of char array used to store values from JSON messages
+#define MAX_VAL_SIZE 10
 
 //Rx Circular Buffer
 uint8_t Rx_buffer[BUFFER_SIZE];
@@ -67,8 +78,10 @@ BUFFER buffTx;
 uint8_t length_of_json = 0;
 //Received JSON string
 char received_json_str[JSON_STRING_SIZE];
-//JSON string
+//JSON string used to extract data from
 char final_json_str[JSON_STRING_SIZE];
+//JSON string to send back to MPU
+char response_json_str[JSON_STRING_SIZE];
 //Array of JSON tokens
 jsmntok_t tokens[TOKEN_ARRAY_SIZE];
 //2 bytes of CRC16 -- Received
@@ -83,8 +96,16 @@ bool new_message_sent = false;
 bool receiving_status = true;
 //to count the number of keys in the JSON message
 uint8_t num_of_keys = 0;
+//count of uDMA errors
+unsigned long uDMA_error_count = 0;
+//count the number of data transfers by uDMA
+unsigned long transfer_count = 0;
+//count of bad ISRs due to uDMA
+unsigned long bad_ISR_udma = 0;
+//destination of ADC value
+uint16_t adc_value = 0;
 
-//information(values) to be received from JSON
+//information (values) to be received from JSON
 uint8_t subsystem;
 uint8_t msg_type;
 uint8_t id;
@@ -126,6 +147,9 @@ static const uint16_t table[256] =
  0x6E17, 0x7E36, 0x4E55, 0x5E74, 0x2E93, 0x3EB2, 0x0ED1, 0x1EF0
 };
 
+//1024-byte aligned channel control table
+#pragma DATA_ALIGN(uc_control_table, 1024)
+unsigned char uc_control_table[256];
 
 void buffer_init(void);
 void buffer_add(BUFFER *buff, char);
@@ -136,7 +160,12 @@ void UART_init(void);
 void UART_config(void);
 void UART0_Handler(void);
 
+void uDMA_init(void);
+void uDMA_adc_config(void);
+void uDMA_Error_Handler(void);
+
 void adc_config(void);
+void ADC0SS3_Handler(void);
 
 void systick_config(void);
 
@@ -157,12 +186,24 @@ int main(void)
     //initialize Rx_buffer and Tx_buffer
     buffer_init();
 
-    //initialization and configuration of required modules and peripherals
+    //initialization and configuration of UART
     UART_init();
     UART_config();
 
-    //Enable interrupts to the processor
+    //ADC configuration
+    adc_config();
+
+    //initializing uDMA controller
+    uDMA_init();
+
+    //configuring uDMA controller
+    uDMA_adc_config();
+
+    //enable interrupts to the processor
     IntMasterEnable();
+
+    //systick configuration and start timer
+    systick_config();
 
     while(1)
     {
@@ -183,20 +224,28 @@ int main(void)
                     jsmn_parse(&parser, final_json_str, strlen(final_json_str), tokens, TOKEN_ARRAY_SIZE);
 
                     //Data extraction from JSON string
-                    if(extract_json() == true)
+                    if(extract_json() == true)//extraction and validation is successful. All information from JSON extracted
                     {
-                        //extraction and validation is successful. All information from JSON extracted
+                        unsigned int receive_systick_val = NVIC_ST_CURRENT_R;
+                        unsigned int clock_count = PIOSC_FREQ/value;
+                        while((NVIC_ST_CURRENT_R - receive_systick_val) != clock_count);
+
+                        ADC0_PSSI_R |= (1 << 3);//sampling on ADC0SS3 begins
+                        snprintf(response_json_str, JSON_STRING_SIZE, "{\"id\":%d,\"subsystem\":%d,\"msg_type\":%d,\"value\":%d}", id, subsystem, msg_type, adc_value);
+                        ADC0_PSSI_R &= ~(1 << 3);//stop sampling on ADC0SS3
                     }
                 }
                 else
                 {
                     /*validation failed*/
                 }
-                new_message_received = false;
-                receiving_status = false;//FOR NOW --- TO BE CHANGED LATER
-                length_of_json = 0;//for next json string to be received
 
-                uint16_t Tx_crc16 = crc16_ccitt(final_json_str, strlen(final_json_str) + 1);
+                new_message_received = false;
+                receiving_status = false;
+                length_of_json = 0;//for next json string to be received
+                num_of_keys = 0;
+
+                uint16_t Tx_crc16 = crc16_ccitt(response_json_str, strlen(response_json_str) + 1);
                 Tx_crc16_bytes[0] = (Tx_crc16 & 0xFF);
                 Tx_crc16_bytes[1] = ((Tx_crc16 >> 8) & 0xFF);
             }
@@ -301,7 +350,7 @@ void UART_config(void)
     //Receive interrupt and Transmit interrupt enabled
     UART0_IM_R |= (1 << 4)|(1 << 5);
 
-    // Set the priority to 1
+    // Set the priority to 0
     IntPrioritySet(INT_UART0, 0);
 
     //Registers a function to be called when an interrupt occurs
@@ -348,10 +397,62 @@ void UART0_Handler(void)
     }
 }
 
+void uDMA_init(void)
+{
+    //providing clock uDMA module
+    SYSCTL_RCGCDMA_R |= (1 << 0);
+
+    //to enable the uDMA controller
+    uDMAEnable();
+
+    //to set the channel control table
+    uDMAControlBaseSet(uc_control_table);
+
+    //set the interrupt priority to 2
+    IntPrioritySet(INT_UDMAERR, 2);
+
+    //registers and enables a function to be called when an uDMA error interrupt occurs
+    uDMAIntRegister(INT_UDMAERR, uDMA_Error_Handler);
+}
+
+void uDMA_adc_config(void)
+{
+    ADCSequenceDMAEnable(ADC0_BASE,3);
+
+    //disable attributes of uDMA channel so that it's in a known state
+    uDMAChannelAttributeDisable(UDMA_CHANNEL_ADC3, UDMA_ATTR_USEBURST | UDMA_ATTR_ALTSELECT | UDMA_ATTR_HIGH_PRIORITY | UDMA_ATTR_REQMASK);
+
+    //setting required attributes for uDMA channel
+    uDMAChannelAttributeEnable(UDMA_CHANNEL_ADC3, UDMA_ATTR_USEBURST);
+
+    //setting the control parameters for uDMA channel control structure
+    uDMAChannelControlSet(UDMA_CHANNEL_ADC3 | UDMA_PRI_SELECT, UDMA_SIZE_16 | UDMA_SRC_INC_NONE | UDMA_DST_INC_NONE | UDMA_ARB_1);
+
+    //sets the transfer parameters for a uDMA channel control structure
+    uDMAChannelTransferSet(UDMA_CHANNEL_ADC3 | UDMA_PRI_SELECT, UDMA_MODE_BASIC, (void *)(ADC0_BASE + ADC_O_SSFIFO3), &adc_value, 1);
+
+    ADCIntEnableEx(ADC0_BASE, ADC_INT_DMA_SS3);
+
+    //Enable the uDMA channel
+    uDMAChannelEnable(UDMA_CHANNEL_ADC3);
+}
+
+void uDMA_Error_Handler(void)
+{
+    unsigned long status;
+    status = uDMAErrorStatusGet();//returns a non-zero value if uDMA error
+
+    if(status)
+    {
+        uDMAErrorStatusClear();
+        uDMA_error_count++;
+    }
+}
+
 void adc_config(void)
 {
-    //Enable the ADC clock using the RCGCADC register. Enabling ADC1
-    SYSCTL_RCGCADC_R |= (1 << 1);
+    //Enable the ADC clock using the RCGCADC register. Enabling ADC0
+    SYSCTL_RCGCADC_R |= (1 << 0);
 
     //Enable GPIO for port B
     SYSCTL_RCGCGPIO_R |= (1 << 1);
@@ -362,26 +463,68 @@ void adc_config(void)
     GPIO_PORTB_DEN_R &= ~(1 << 5);
     GPIO_PORTB_AMSEL_R |= (1 << 5);
 
-    //Using SS3, disabling for configuration
-    ADC1_ACTSS_R &= ~(1 << 3);
+    //using SS3, disabling for configuration
+    ADC0_ACTSS_R &= ~(1 << 3);
 
-    //Processor(default) trigger. The trigger is initiated by setting the SS3 bit in the ADCPSSI register
-    ADC1_EMUX_R |= (0x0 << 12);
+    //processor trigger (default). The trigger is initiated by setting the SS3 bit in the ADCPSSI register
+    ADC0_EMUX_R |= (0x0 << 12);
 
     //AIN11-PB5. Configuring the input source for the sample sequencer 3
-    ADC1_SSMUX3_R = 11;
+    ADC0_SSMUX3_R = 11;
 
-    //End of Sequence. This bit must be set before initiating a single sample sequence.
-    ADC1_SSCTL3_R |= (1 << 1);
+    //end of sequence, this bit must be set before initiating a single sample sequence. IE bit set
+    ADC0_SSCTL3_R |= (1 << 1)|(1 << 2);
 
-    //Enabling SS3
-    ADC1_ACTSS_R |= (1 << 3);
+    //set the corresponding MASK bit in the ADCIM register
+    ADC0_IM_R |= (1 << 3);
+
+    //enabling SS3
+    ADC0_ACTSS_R |= (1 << 3);
+
+    //set the interrupt priority to 2
+    IntPrioritySet(INT_ADC0SS3, 1);
+
+    //registers a function to be called when an interrupt occurs when uDMA tarnsfer completes
+    IntRegister(INT_ADC0SS3, ADC0SS3_Handler);
+
+    //enable the NVIC for the UART0
+    IntEnable(INT_ADC0SS3);
+}
+
+void ADC0SS3_Handler(void)
+{
+
+    unsigned long mode;
+    mode = uDMAChannelModeGet(UDMA_CHANNEL_ADC3);
+
+    if(mode == UDMA_MODE_STOP)
+    {
+        transfer_count++;
+        //sets the transfer parameters for a uDMA channel control structure
+        uDMAChannelTransferSet(UDMA_CHANNEL_ADC3 | UDMA_PRI_SELECT, UDMA_MODE_BASIC, (void *)(ADC0_BASE + ADC_O_SSFIFO3), &adc_value, 1);
+        //Enable the uDMA channel
+        uDMAChannelEnable(UDMA_CHANNEL_ADC3);
+    }
+    else
+    {
+        bad_ISR_udma++;
+    }
+
+    //clear ADC0SS3 interrupt flag
+    ADC0_ISC_R |= (1 << 3);
+
+
+/*
+    adc_value = ADC0_SSFIFO3_R;
+    //clear ADC0SS3 interrupt flag
+    ADC0_ISC_R |= (1 << 3);
+*/
 }
 
 void systick_config(void)
 {
     NVIC_ST_CTRL_R = 0x04;//enable = 0, clk_src = 1 (System Clock=>PIOSC=16MHz)
-    NVIC_ST_RELOAD_R = 533334 - 1;//30Hz(=0.033secs) frequency for systick thread
+    NVIC_ST_RELOAD_R = 1600000 - 1;//10Hz(=0.1secs) frequency for systick thread
     NVIC_ST_CURRENT_R = 0x00; //to clear by writing to the current value register
     NVIC_ST_CTRL_R |= (1 << 0); //enable and start timer
 }
@@ -473,7 +616,7 @@ void send_message(void)
                 {
                     case JSON_HEADER:
                     {
-                        outgoing_data = final_json_str[json_str_index];
+                        outgoing_data = response_json_str[json_str_index];
                         if(outgoing_data == '{')
                         {
                             send_data(outgoing_data);
@@ -484,7 +627,7 @@ void send_message(void)
                     break;
                     case JSON_ENDING:
                     {
-                        outgoing_data = final_json_str[json_str_index];
+                        outgoing_data = response_json_str[json_str_index];
                         if(outgoing_data == '\0')
                         {
                             send_data(outgoing_data);
@@ -544,7 +687,7 @@ bool validate_message(void)
 bool get_key_value(uint8_t value_index, enum token token_type)
 {
     int token_length = tokens[value_index].end - tokens[value_index].start;
-    char val[10];
+    char val[MAX_VAL_SIZE];
     strncpy(val, &final_json_str[tokens[value_index].start], token_length);
     val[token_length] = '\0';
     if(!isdigit(val[0]))
@@ -584,7 +727,7 @@ int search_key(const char *key_string)
     bool search_flag = false;
     uint8_t token_index = 1;
     uint8_t key_count = 0;
-    char key[20];
+    char key[MAX_KEY_SIZE];
 
     while(key_count < num_of_keys)
     {
