@@ -8,8 +8,6 @@
 #include "inc/hw_memmap.h"
 #include "inc/hw_adc.h"
 #include "driverlib/interrupt.h"
-#include "driverlib/udma.h"
-#include "driverlib/adc.h"
 #include "jsmn.h"
 
 
@@ -407,8 +405,11 @@ void uDMA_init(void)
     //set the interrupt priority to 2
     IntPrioritySet(INT_UDMAERR, 2);
 
-    //registers AND enables a function to be called when an uDMA error interrupt occurs
-    uDMAIntRegister(INT_UDMAERR, uDMA_Error_Handler);
+    //registers a function to be called when an uDMA error interrupt occurs
+    IntRegister(INT_UDMAERR, uDMA_Error_Handler);
+
+    //enable uDMA interrupt
+    IntEnable(INT_UDMAERR);
 }
 
 void uDMA_config_ADC0SS3(void)
@@ -450,12 +451,9 @@ void uDMA_config_ADC0SS3(void)
 
 void uDMA_Error_Handler(void)
 {
-    unsigned long status;
-    status = uDMAErrorStatusGet();//returns a non-zero value if uDMA error
-
-    if(status)
+    if( ((UDMA_ERRCLR_R) & (1 << 0)) == 1)
     {
-        uDMAErrorStatusClear();
+        UDMA_ERRCLR_R = 1;//clear uDMA error
         uDMA_error_count++;
     }
 }
