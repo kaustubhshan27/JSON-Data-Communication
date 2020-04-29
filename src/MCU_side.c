@@ -103,7 +103,7 @@ unsigned long transfer_count = 0;
 //count of bad ISRs due to uDMA
 unsigned long bad_ISR_udma = 0;
 //destination of ADC value
-uint16_t adc_value = 0;
+uint32_t adc_value = 0;
 
 //information (values) to be received from JSON
 uint8_t subsystem;
@@ -149,7 +149,7 @@ static const uint16_t table[256] =
 
 //1024-byte aligned channel control table
 #pragma DATA_ALIGN(uc_control_table, 1024)
-unsigned char uc_control_table[256];
+uint32_t uc_control_table[256];
 
 void buffer_init(void);
 void buffer_add(BUFFER *buff, char);
@@ -161,7 +161,7 @@ void UART_config(void);
 void UART0_Handler(void);
 
 void uDMA_init(void);
-void uDMA_adc_config(void);
+void uDMA_config_ADC0SS3(void);
 void uDMA_Error_Handler(void);
 
 void adc_config(void);
@@ -197,7 +197,7 @@ int main(void)
     uDMA_init();
 
     //configuring uDMA controller
-    uDMA_adc_config();
+    uDMA_config_ADC0SS3();
 
     //enable interrupts to the processor
     IntMasterEnable();
@@ -226,10 +226,6 @@ int main(void)
                     //Data extraction from JSON string
                     if(extract_json() == true)//extraction and validation is successful. All information from JSON extracted
                     {
-                        unsigned int receive_systick_val = NVIC_ST_CURRENT_R;
-                        unsigned int clock_count = PIOSC_FREQ/value;
-                        while((NVIC_ST_CURRENT_R - receive_systick_val) != clock_count);
-
                         ADC0_PSSI_R |= (1 << 3);//sampling on ADC0SS3 begins
                         snprintf(response_json_str, JSON_STRING_SIZE, "{\"id\":%d,\"subsystem\":%d,\"msg_type\":%d,\"value\":%d}", id, subsystem, msg_type, adc_value);
                         ADC0_PSSI_R &= ~(1 << 3);//stop sampling on ADC0SS3
@@ -403,38 +399,53 @@ void uDMA_init(void)
     SYSCTL_RCGCDMA_R |= (1 << 0);
 
     //to enable the uDMA controller
-    uDMAEnable();
+    UDMA_CFG_R |= (1 << 0);
 
     //to set the channel control table
-    uDMAControlBaseSet(uc_control_table);
+    UDMA_CTLBASE_R = (uint32_t)uc_control_table;
 
     //set the interrupt priority to 2
     IntPrioritySet(INT_UDMAERR, 2);
 
-    //registers and enables a function to be called when an uDMA error interrupt occurs
+    //registers AND enables a function to be called when an uDMA error interrupt occurs
     uDMAIntRegister(INT_UDMAERR, uDMA_Error_Handler);
 }
 
-void uDMA_adc_config(void)
+void uDMA_config_ADC0SS3(void)
 {
-    ADCSequenceDMAEnable(ADC0_BASE,3);
+    //default priority for channel ADC0SS3
+    UDMA_PRIOCLR_R |= (1 << 17);
 
-    //disable attributes of uDMA channel so that it's in a known state
-    uDMAChannelAttributeDisable(UDMA_CHANNEL_ADC3, UDMA_ATTR_USEBURST | UDMA_ATTR_ALTSELECT | UDMA_ATTR_HIGH_PRIORITY | UDMA_ATTR_REQMASK);
+    //alternate table not used, use primary control
+    UDMA_ALTCLR_R |= (1 << 17);
 
-    //setting required attributes for uDMA channel
-    uDMAChannelAttributeEnable(UDMA_CHANNEL_ADC3, UDMA_ATTR_USEBURST);
+    //ADC only supports burst requests, burst requests set for ADC0SS3
+    UDMA_USEBURSTSET_R |= (1 << 17);
 
-    //setting the control parameters for uDMA channel control structure
-    uDMAChannelControlSet(UDMA_CHANNEL_ADC3 | UDMA_PRI_SELECT, UDMA_SIZE_16 | UDMA_SRC_INC_NONE | UDMA_DST_INC_NONE | UDMA_ARB_1);
+    //allow uDMA controller to recognize requests from ADC0SS3
+    UDMA_REQMASKCLR_R |= (1 << 17);
 
-    //sets the transfer parameters for a uDMA channel control structure
-    uDMAChannelTransferSet(UDMA_CHANNEL_ADC3 | UDMA_PRI_SELECT, UDMA_MODE_BASIC, (void *)(ADC0_BASE + ADC_O_SSFIFO3), &adc_value, 1);
+    //address of last byte of source buffer
+    uc_control_table[17*4] = (uint32_t)(ADC0_BASE+ADC_O_SSFIFO3) + 4 - 1;
 
-    ADCIntEnableEx(ADC0_BASE, ADC_INT_DMA_SS3);
+    //address of last byte of destination buffer
+    uint32_t *adc_value_address = &adc_value;
+    uc_control_table[17*4 + 1] = (uint32_t)adc_value_address + 4 - 1;
 
-    //Enable the uDMA channel
-    uDMAChannelEnable(UDMA_CHANNEL_ADC3);
+    //control word configuration
+    /*
+     * DSTINC - NONE
+     * DSTSIZE - halfword(16 bits)
+     * SRCINC - NONE
+     * SRCSIZE - halfword(16 bits)
+     * ARBSIZE - 1
+     * XFERSIZE - 1
+     * NXTUSEBURST - NONE
+     * XFERMODE - BASIC
+     */
+    uc_control_table[17*4 + 2] = 0xEE000001;
+
+    UDMA_ENASET_R |= (1 << 17);
 }
 
 void uDMA_Error_Handler(void)
@@ -493,17 +504,26 @@ void adc_config(void)
 
 void ADC0SS3_Handler(void)
 {
-
-    unsigned long mode;
-    mode = uDMAChannelModeGet(UDMA_CHANNEL_ADC3);
-
-    if(mode == UDMA_MODE_STOP)
+    if( ((UDMA_ENASET_R) & (1 << 17)) == 0)
     {
         transfer_count++;
+
         //sets the transfer parameters for a uDMA channel control structure
-        uDMAChannelTransferSet(UDMA_CHANNEL_ADC3 | UDMA_PRI_SELECT, UDMA_MODE_BASIC, (void *)(ADC0_BASE + ADC_O_SSFIFO3), &adc_value, 1);
+        //control word configuration
+            /*
+             * DSTINC - NONE
+             * DSTSIZE - halfword(16 bits)
+             * SRCINC - NONE
+             * SRCSIZE - halfword(16 bits)
+             * ARBSIZE - 1
+             * XFERSIZE - 1
+             * NXTUSEBURST - NONE
+             * XFERMODE - BASIC
+             */
+        uc_control_table[17*4 + 2] = 0xEE000001;
+
         //Enable the uDMA channel
-        uDMAChannelEnable(UDMA_CHANNEL_ADC3);
+        UDMA_ENASET_R |= (1 << 17);
     }
     else
     {
@@ -512,13 +532,6 @@ void ADC0SS3_Handler(void)
 
     //clear ADC0SS3 interrupt flag
     ADC0_ISC_R |= (1 << 3);
-
-
-/*
-    adc_value = ADC0_SSFIFO3_R;
-    //clear ADC0SS3 interrupt flag
-    ADC0_ISC_R |= (1 << 3);
-*/
 }
 
 void systick_config(void)
