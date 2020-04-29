@@ -436,9 +436,9 @@ void uDMA_config_ADC0SS3(void)
     //control word configuration
     /*
      * DSTINC - NONE
-     * DSTSIZE - halfword(16 bits)
+     * DSTSIZE - word(32 bits)
      * SRCINC - NONE
-     * SRCSIZE - halfword(16 bits)
+     * SRCSIZE - word(32 bits)
      * ARBSIZE - 1
      * XFERSIZE - 1
      * NXTUSEBURST - NONE
@@ -510,9 +510,9 @@ void ADC0SS3_Handler(void)
         //control word configuration
             /*
              * DSTINC - NONE
-             * DSTSIZE - halfword(16 bits)
+             * DSTSIZE - word(32 bits)
              * SRCINC - NONE
-             * SRCSIZE - halfword(16 bits)
+             * SRCSIZE - word(32 bits)
              * ARBSIZE - 1
              * XFERSIZE - 1
              * NXTUSEBURST - NONE
