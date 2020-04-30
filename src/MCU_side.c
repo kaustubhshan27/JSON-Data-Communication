@@ -45,7 +45,7 @@ enum subsystem_type
     POTENTIOMETER_SUB = 2
 };
 
-enum msg_type
+enum msg
 {
     RESPONSE = 0,
     REQUEST = 1
@@ -240,7 +240,7 @@ int main(void)
                         {
                             case POTENTIOMETER_SUB:
                             {
-                                switch(msg_type)
+                                switch(msg)
                                 {
                                     case REQUEST:
                                     {
