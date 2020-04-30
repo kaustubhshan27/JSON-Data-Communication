@@ -39,6 +39,18 @@ enum token
     VALUE_TOKEN = 4
 };
 
+enum subsystem_type
+{
+    MOTOR_SUB = 1,
+    POTENTIOMETER_SUB = 2
+};
+
+enum msg_type
+{
+    RESPONSE = 0,
+    REQUEST = 1
+};
+
 //Clock Frequency PIOSC (16MHz)
 #define PIOSC_FREQ 16000000
 //Buffer Size
@@ -224,9 +236,27 @@ int main(void)
                     //Data extraction from JSON string
                     if(extract_json() == true)//extraction and validation is successful. All information from JSON extracted
                     {
-                        ADC0_PSSI_R |= (1 << 3);//sampling on ADC0SS3 begins
-                        snprintf(response_json_str, JSON_STRING_SIZE, "{\"id\":%d,\"subsystem\":%d,\"msg_type\":%d,\"value\":%d}", id, subsystem, msg_type, adc_value);
-                        ADC0_PSSI_R &= ~(1 << 3);//stop sampling on ADC0SS3
+                        switch(subsystem)
+                        {
+                            case POTENTIOMETER_SUB:
+                            {
+                                switch(msg_type)
+                                {
+                                    case REQUEST:
+                                    {
+                                        switch(id)
+                                        {
+                                            case 1:
+                                            {
+                                                ADC0_PSSI_R |= (1 << 3);//sampling on ADC0SS3 begins
+                                                snprintf(response_json_str, JSON_STRING_SIZE, "{\"id\":%d,\"subsystem\":%d,\"msg_type\":%d,\"value\":%d}", id, subsystem, msg_type, adc_value);
+                                                ADC0_PSSI_R &= ~(1 << 3);//stop sampling on ADC0SS3
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
                 else
